@@ -1,0 +1,98 @@
+#!/bin/bash
+
+set -e
+
+# Variables
+WG_INTERFACE="wg0"
+WG_PORT=51820
+WG_DASHBOARD_PORT=10086
+WG_DASHBOARD_DIR="/opt/wg-dashboard"
+WG_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
+SERVER_PRIV_KEY=$(wg genkey)
+SERVER_PUB_KEY=$(echo "$SERVER_PRIV_KEY" | wg pubkey)
+PEER_PRIV_KEY=$(wg genkey)
+PEER_PUB_KEY=$(echo "$PEER_PRIV_KEY" | wg pubkey)
+PEER_PRESHARED_KEY=$(wg genpsk)
+SERVER_IP="10.0.0.1"
+PEER_IP="10.0.0.2"
+
+# Install dependencies
+apt update
+apt install -y wireguard qrencode curl git ufw
+
+# Enable IP forwarding
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard-forward.conf
+sysctl --system
+
+# Create WireGuard config
+mkdir -p /etc/wireguard
+cat > "$WG_CONFIG" <<EOF
+[Interface]
+Address = ${SERVER_IP}/24
+ListenPort = ${WG_PORT}
+PrivateKey = ${SERVER_PRIV_KEY}
+PostUp = ufw route allow in on ${WG_INTERFACE} out on eth0
+PostDown = ufw route delete allow in on ${WG_INTERFACE} out on eth0
+
+[Peer]
+PublicKey = ${PEER_PUB_KEY}
+PresharedKey = ${PEER_PRESHARED_KEY}
+AllowedIPs = ${PEER_IP}/32
+EOF
+
+chmod 600 "$WG_CONFIG"
+
+# Enable and start WireGuard
+systemctl enable wg-quick@${WG_INTERFACE}
+systemctl start wg-quick@${WG_INTERFACE}
+
+# Configure UFW
+ufw allow ${WG_PORT}/udp
+ufw allow ${WG_DASHBOARD_PORT}/tcp
+ufw enable
+
+# Install WGDashboard
+git clone https://github.com/$(curl -s https://api.github.com/repos/$(curl -s https://api.github.com/repos/$(curl -s https://api.github.com/repos/community-scripts/ProxmoxVE/contents/ct/wireguard.sh | grep -oP '(?<=github.com/)[^"]+wg-dashboard[^"]+') | head -n 1) | grep -oP '(?<=full_name": ")[^"]+') ${WG_DASHBOARD_DIR}
+cd ${WG_DASHBOARD_DIR}
+bash install.sh --port ${WG_DASHBOARD_PORT}
+
+# Create systemd service for WGDashboard
+cat > /etc/systemd/system/wg-dashboard.service <<EOF
+[Unit]
+Description=WGDashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${WG_DASHBOARD_DIR}
+ExecStart=/usr/bin/python3 app.py --port ${WG_DASHBOARD_PORT}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reexec
+systemctl daemon-reload
+systemctl enable wg-dashboard
+systemctl start wg-dashboard
+
+# Generate peer config and QR code
+PEER_CONFIG=$(cat <<EOF
+[Interface]
+PrivateKey = ${PEER_PRIV_KEY}
+Address = ${PEER_IP}/24
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = ${SERVER_PUB_KEY}
+PresharedKey = ${PEER_PRESHARED_KEY}
+Endpoint = $(hostname -I | awk '{print $1}'):${WG_PORT}
+AllowedIPs = 0.0.0.0/0, ::/0
+EOF
+)
+
+echo "$PEER_CONFIG" > /root/peer.conf
+qrencode -t ansiutf8 < /root/peer.conf
+
+echo "WireGuard and WGDashboard setup complete."
